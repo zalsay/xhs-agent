@@ -1,0 +1,359 @@
+"use strict";
+/**
+ * xhs_agent - 小红书发布代理 (CDP Stealth 模式)
+ *
+ * 使用 CDP 连接模式避免自动化检测：
+ * - navigator.webdriver = false
+ * - 保留用户真实 Cookies、历史记录、插件
+ * - 完全真实的浏览器指纹
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+const playwright_1 = require("playwright");
+const path = __importStar(require("path"));
+const os = __importStar(require("os"));
+const fs = __importStar(require("fs"));
+const readline = __importStar(require("readline"));
+const https = __importStar(require("https"));
+const child_process_1 = require("child_process");
+// ============================================================================
+// CDP 配置
+// ============================================================================
+const CDP_PORT = 9222;
+const CDP_ENDPOINT = `http://127.0.0.1:${CDP_PORT}`;
+const USER_DATA_DIR = path.join(os.homedir(), '.auto-tauri', 'browser-profile');
+// Chrome 可执行文件路径 (macOS)
+const CHROME_PATHS = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+];
+// Helper for logging
+const log = (msg) => console.error(JSON.stringify({ type: 'log', message: `[XHS Agent] ${msg}`, timestamp: new Date().toISOString() }));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// ============================================================================
+// CDP 浏览器管理
+// ============================================================================
+let chromeProcess = null;
+function getChromePath() {
+    for (const chromePath of CHROME_PATHS) {
+        if (fs.existsSync(chromePath)) {
+            return chromePath;
+        }
+    }
+    return null;
+}
+async function isCDPAvailable() {
+    try {
+        const response = await fetch(`${CDP_ENDPOINT}/json/version`);
+        return response.ok;
+    }
+    catch {
+        return false;
+    }
+}
+async function launchChrome() {
+    const chromePath = getChromePath();
+    if (!chromePath) {
+        throw new Error('Chrome 未找到，请安装 Google Chrome');
+    }
+    if (!fs.existsSync(USER_DATA_DIR)) {
+        fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    }
+    log(`正在启动 Chrome (CDP Stealth 模式)...`);
+    log(`Chrome 路径: ${chromePath}`);
+    log(`用户数据目录: ${USER_DATA_DIR}`);
+    chromeProcess = (0, child_process_1.spawn)(chromePath, [
+        `--remote-debugging-port=${CDP_PORT}`,
+        `--user-data-dir=${USER_DATA_DIR}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+    ], {
+        detached: true,
+        stdio: 'ignore'
+    });
+    chromeProcess.unref();
+    log(`等待 CDP 端口就绪...`);
+    let retries = 0;
+    const maxRetries = 20;
+    while (retries < maxRetries) {
+        if (await isCDPAvailable()) {
+            log(`CDP 端口已就绪`);
+            return;
+        }
+        await sleep(500);
+        retries++;
+    }
+    throw new Error('Chrome 启动超时');
+}
+async function connectCDP() {
+    if (await isCDPAvailable()) {
+        log(`检测到已运行的 Chrome，正在连接...`);
+    }
+    else {
+        await launchChrome();
+    }
+    const browser = await playwright_1.chromium.connectOverCDP(CDP_ENDPOINT);
+    log(`已通过 CDP 连接到浏览器 (Stealth 模式)`);
+    return browser;
+}
+async function getOrCreatePage(browser) {
+    const contexts = browser.contexts();
+    if (contexts.length > 0) {
+        const context = contexts[0];
+        const pages = context.pages();
+        if (pages.length > 0) {
+            log(`使用现有页面`);
+            return pages[0];
+        }
+        log(`在现有上下文中创建新页面`);
+        return await context.newPage();
+    }
+    log(`创建新的浏览器上下文和页面`);
+    const context = await browser.newContext({
+        viewport: { width: 1280, height: 800 }
+    });
+    return await context.newPage();
+}
+async function downloadImage(url, dest) {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+        https.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download image: ${response.statusCode} ${response.statusMessage}`));
+                return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', (err) => {
+            fs.unlink(dest, () => { });
+            reject(err);
+        });
+    });
+}
+// ============================================================================
+// 主发布流程
+// ============================================================================
+async function runPublish(config) {
+    if (!config.imagePath) {
+        throw new Error("Image path is required for XHS publish.");
+    }
+    let actualImagePath = config.imagePath;
+    // Handle URL downloading using native https
+    if (config.imagePath.startsWith('http')) {
+        log(`Downloading image from URL: ${config.imagePath}`);
+        const tmpDir = path.join(os.tmpdir(), 'auto-tauri-xhs');
+        if (!fs.existsSync(tmpDir))
+            fs.mkdirSync(tmpDir, { recursive: true });
+        actualImagePath = path.join(tmpDir, `publish_${Date.now()}.png`);
+        try {
+            await downloadImage(config.imagePath, actualImagePath);
+            log("Download complete.");
+        }
+        catch (e) {
+            throw new Error(`Failed to download image: ${e.message}`);
+        }
+    }
+    else if (config.imagePath.startsWith('data:image')) {
+        // Handle Base64 image
+        log(`Processing Base64 image...`);
+        try {
+            const matches = config.imagePath.match(/^data:image\/([a-zA-Z]+);base64,(.+)$/);
+            if (!matches || matches.length !== 3) {
+                throw new Error('Invalid Base64 image format');
+            }
+            const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+            const base64Data = matches[2];
+            const buffer = Buffer.from(base64Data, 'base64');
+            const tmpDir = path.join(os.tmpdir(), 'auto-tauri-xhs');
+            if (!fs.existsSync(tmpDir))
+                fs.mkdirSync(tmpDir, { recursive: true });
+            actualImagePath = path.join(tmpDir, `publish_base64_${Date.now()}.${ext}`);
+            fs.writeFileSync(actualImagePath, buffer);
+            log(`Base64 image saved to: ${actualImagePath}`);
+        }
+        catch (e) {
+            throw new Error(`Failed to process Base64 image: ${e.message}`);
+        }
+    }
+    if (!fs.existsSync(actualImagePath)) {
+        throw new Error(`Image file not found: ${actualImagePath}`);
+    }
+    log("Initializing CDP Stealth browser connection...");
+    // 使用 CDP 连接模式
+    const browser = await connectCDP();
+    const page = await getOrCreatePage(browser);
+    try {
+        log("Navigating to Xiaohongshu Creator Center...");
+        await page.goto('https://creator.xiaohongshu.com/publish/publish', { waitUntil: 'networkidle', timeout: 60000 });
+        const checkPublishPage = () => page.url().includes('/publish/publish');
+        if (!checkPublishPage()) {
+            log("--- ACTION REQUIRED ---");
+            log("Waiting for user to reach the Publish page...");
+            const startTime = Date.now();
+            while (!checkPublishPage()) {
+                if (Date.now() - startTime > 120000) {
+                    throw new Error("Timeout waiting for login. Please reach the publish page manually.");
+                }
+                try {
+                    await page.waitForURL('**/publish/publish', { timeout: 5000 });
+                }
+                catch (e) {
+                    if (!checkPublishPage()) {
+                        log("Still waiting for you to reach the Publish page... (Please log in)");
+                    }
+                }
+            }
+            log("Target page detected! Proceeding...");
+        }
+        log("Looking for upload area...");
+        const imageTab = page.getByText('上传图文', { exact: true }).first();
+        if (await imageTab.isVisible()) {
+            log("Clicking '上传图文' tab...");
+            await imageTab.dispatchEvent('click');
+            await page.waitForTimeout(2000);
+        }
+        log("Uploading image...");
+        const fileInput = page.locator('input[type="file"]');
+        await fileInput.waitFor({ state: 'attached', timeout: 20000 });
+        await fileInput.setInputFiles(actualImagePath);
+        log("Waiting for upload processing...");
+        await page.waitForTimeout(5000);
+        log("Filling title and content...");
+        const titleInput = page.locator('input[placeholder*="标题"]');
+        await titleInput.fill(config.title);
+        const combinedContent = `${config.title}\n${config.content}`;
+        const contentArea = page.locator('#post-textarea');
+        if (await contentArea.count() > 0) {
+            await contentArea.fill(combinedContent);
+        }
+        else {
+            await page.keyboard.press('Tab');
+            await page.keyboard.type(combinedContent);
+        }
+        log("Ready to publish!");
+        const publishButton = page.getByRole('button', { name: '发布', exact: true });
+        const publishButtonFallback = page.getByText('发布', { exact: true });
+        if (await publishButton.isVisible()) {
+            await publishButton.click();
+        }
+        else if (await publishButtonFallback.isVisible()) {
+            await publishButtonFallback.click();
+        }
+        else {
+            const publishNoteBtn = page.getByText('发布笔记', { exact: true });
+            if (await publishNoteBtn.isVisible()) {
+                await publishNoteBtn.click();
+            }
+            else {
+                throw new Error("Publish button not found");
+            }
+        }
+        log("Published! Waiting for confirmation...");
+        // Wait for success message or URL change
+        try {
+            await Promise.race([
+                page.getByText('发布成功').waitFor({ timeout: 10000 }),
+                page.getByText('发布笔记成功').waitFor({ timeout: 10000 }),
+                page.waitForURL('**/note/**', { timeout: 10000 }) // Assuming it redirects to note details
+            ]);
+            log("Success detected!");
+        }
+        catch (e) {
+            log("Success message not detected immediately. Checking page content...");
+            const pageText = await page.innerText('body');
+            log(`Current Page URL: ${page.url()}`);
+            log(`Page Content Dump:\n${pageText}`); // Print full content
+        }
+        await page.waitForTimeout(2000);
+        console.log(JSON.stringify({ taskId: config.taskId, status: 'success', data: { message: '发布操作已执行，请检查小红书后台确认。' } }));
+    }
+    catch (e) {
+        log(`Error: ${e.message}`);
+        console.log(JSON.stringify({ taskId: config.taskId, status: 'failed', error: e.message }));
+    }
+    finally {
+        // 断开连接但不关闭浏览器
+        log("Disconnecting from browser (browser remains open)...");
+        await browser.close();
+    }
+}
+// ============================================================================
+// 主入口
+// ============================================================================
+async function main() {
+    const args = process.argv.slice(2);
+    // If no args, wait for stdin (JSON)
+    if (args.length === 0) {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            terminal: false
+        });
+        for await (const line of rl) {
+            if (line.trim()) {
+                let config;
+                try {
+                    config = JSON.parse(line);
+                }
+                catch (e) {
+                    console.error(JSON.stringify({ type: 'error', message: `Invalid JSON on stdin: ${e.message}` }));
+                    process.exit(1);
+                }
+                try {
+                    await runPublish(config);
+                    break;
+                }
+                catch (e) {
+                    log(`Execution error: ${e.message}`);
+                    console.log(JSON.stringify({ taskId: config?.taskId, status: 'failed', error: e.message }));
+                    process.exit(1);
+                }
+            }
+        }
+    }
+    else {
+        // Handle CLI args for backward compatibility
+        const config = {
+            imagePath: args[0],
+            title: args[1],
+            content: args[2] || ''
+        };
+        await runPublish(config);
+    }
+}
+main().catch(console.error);

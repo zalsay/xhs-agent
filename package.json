@@ -1,0 +1,25 @@
+{
+  "name": "xhs_agent",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "bundle": "npm run build && ncc build dist/index.js -o dist/bundle",
+    "package": "npm run bundle && pkg dist/bundle/index.js --targets node18-macos-arm64 --output ../desktop/src-tauri/binaries/xhs-agent-aarch64-apple-darwin",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Xiaohongshu publish agent with CDP Stealth mode",
+  "dependencies": {
+    "@types/node": "^25.0.3",
+    "playwright": "^1.57.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.4",
+    "pkg": "^5.8.1"
+  }
+}
