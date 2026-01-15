@@ -138,7 +138,8 @@ async function getOrCreatePage(browser: Browser): Promise<Page> {
 // ============================================================================
 
 interface PublishConfig {
-    imagePath: string;
+    imagePaths?: string[];  // Array of image paths/URLs
+    imagePath?: string;     // Single image path (backward compatibility)
     title: string;
     content: string;
     taskId?: string;
@@ -169,52 +170,66 @@ async function downloadImage(url: string, dest: string): Promise<void> {
 // ============================================================================
 
 async function runPublish(config: PublishConfig) {
-    if (!config.imagePath) {
-        throw new Error("Image path is required for XHS publish.");
+    // Support both imagePaths (array) and imagePath (single) for backward compatibility
+    let sourceImagePaths: string[] = [];
+    if (config.imagePaths && config.imagePaths.length > 0) {
+        sourceImagePaths = config.imagePaths;
+        log(`Processing ${sourceImagePaths.length} images from imagePaths array`);
+    } else if (config.imagePath) {
+        sourceImagePaths = [config.imagePath];
+        log(`Using single imagePath`);
+    } else {
+        throw new Error("Image path is required for XHS publish. Please provide imagePaths or imagePath.");
     }
 
-    let actualImagePath = config.imagePath;
+    // Process all images (download URLs, decode base64, etc.)
+    const actualImagePaths: string[] = [];
+    const tmpDir = path.join(os.tmpdir(), 'auto-tauri-xhs');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    // Handle URL downloading using native https
-    if (config.imagePath.startsWith('http')) {
-        log(`Downloading image from URL: ${config.imagePath}`);
-        const tmpDir = path.join(os.tmpdir(), 'auto-tauri-xhs');
-        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-        actualImagePath = path.join(tmpDir, `publish_${Date.now()}.png`);
+    for (let i = 0; i < sourceImagePaths.length; i++) {
+        const sourcePath = sourceImagePaths[i];
+        let actualPath = sourcePath;
 
-        try {
-            await downloadImage(config.imagePath, actualImagePath);
-            log("Download complete.");
-        } catch (e: any) {
-            throw new Error(`Failed to download image: ${e.message}`);
-        }
-    } else if (config.imagePath.startsWith('data:image')) {
-        // Handle Base64 image
-        log(`Processing Base64 image...`);
-        try {
-            const matches = config.imagePath.match(/^data:image\/([a-zA-Z]+);base64,(.+)$/);
-            if (!matches || matches.length !== 3) {
-                throw new Error('Invalid Base64 image format');
+        log(`Processing image ${i + 1}/${sourceImagePaths.length}: ${sourcePath.substring(0, 50)}...`);
+
+        if (sourcePath.startsWith('http')) {
+            // Download from URL
+            actualPath = path.join(tmpDir, `publish_${Date.now()}_${i}.png`);
+            try {
+                await downloadImage(sourcePath, actualPath);
+                log(`Downloaded image ${i + 1}`);
+            } catch (e: any) {
+                throw new Error(`Failed to download image ${i + 1}: ${e.message}`);
             }
+        } else if (sourcePath.startsWith('data:image')) {
+            // Handle Base64 image
+            try {
+                const matches = sourcePath.match(/^data:image\/([a-zA-Z]+);base64,(.+)$/);
+                if (!matches || matches.length !== 3) {
+                    throw new Error('Invalid Base64 image format');
+                }
 
-            const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
-            const base64Data = matches[2];
-            const buffer = Buffer.from(base64Data, 'base64');
+                const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+                const base64Data = matches[2];
+                const buffer = Buffer.from(base64Data, 'base64');
 
-            const tmpDir = path.join(os.tmpdir(), 'auto-tauri-xhs');
-            if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-
-            actualImagePath = path.join(tmpDir, `publish_base64_${Date.now()}.${ext}`);
-            fs.writeFileSync(actualImagePath, buffer);
-            log(`Base64 image saved to: ${actualImagePath}`);
-        } catch (e: any) {
-            throw new Error(`Failed to process Base64 image: ${e.message}`);
+                actualPath = path.join(tmpDir, `publish_base64_${Date.now()}_${i}.${ext}`);
+                fs.writeFileSync(actualPath, buffer);
+                log(`Saved Base64 image ${i + 1} to: ${actualPath}`);
+            } catch (e: any) {
+                throw new Error(`Failed to process Base64 image ${i + 1}: ${e.message}`);
+            }
         }
+
+        if (!fs.existsSync(actualPath)) {
+            throw new Error(`Image file not found: ${actualPath}`);
+        }
+
+        actualImagePaths.push(actualPath);
     }
 
-    if (!fs.existsSync(actualImagePath)) {
-        throw new Error(`Image file not found: ${actualImagePath}`);
-    }
+    log(`All ${actualImagePaths.length} images processed successfully`);
 
     log("Initializing CDP Stealth browser connection...");
 
@@ -256,50 +271,52 @@ async function runPublish(config: PublishConfig) {
             await page.waitForTimeout(2000);
         }
 
-        log("Uploading image...");
-        const fileInput = page.locator('input[type="file"]');
+        // Upload ALL images at once using setInputFiles with array
+        log(`Uploading ${actualImagePaths.length} images...`);
+        const fileInput = page.locator('input[type=\"file\"]');
         await fileInput.waitFor({ state: 'attached', timeout: 30000 });
-        await fileInput.setInputFiles(actualImagePath);
+        await fileInput.setInputFiles(actualImagePaths);  // Upload all images at once
 
-        // Initial wait for upload to start and process
-        log("Waiting 30 seconds for initial upload processing...");
-        await page.waitForTimeout(30000);
+        // Initial wait for upload to start and process (longer for multiple images)
+        const waitTime = Math.min(30 + (actualImagePaths.length - 1) * 5, 60); // Extra 10s per image, max 60s
+        log(`Waiting ${waitTime} seconds for initial upload processing (${actualImagePaths.length} images)...`);
+        await page.waitForTimeout(waitTime * 1000);
 
         // Then continue with polling loop (1 second intervals)
-        log("Continuing with upload status polling...");
-        const maxUploadWait = 60; // Max 60 seconds
-        for (let i = 0; i < maxUploadWait; i++) {
-            await page.waitForTimeout(1000);
+        // log("Continuing with upload status polling...");
+        // const maxUploadWait = 60; // Max 60 seconds
+        // for (let i = 0; i < maxUploadWait; i++) {
+        //     await page.waitForTimeout(1000);
 
-            // Check if upload progress indicator is still visible
-            const uploadingIndicators = [
-                page.locator('.upload-progress'),
-                page.locator('[class*="uploading"]'),
-                page.locator('[class*="progress"]'),
-                page.getByText('上传中'),
-                page.getByText('正在上传')
-            ];
+        //     // Check if upload progress indicator is still visible
+        //     const uploadingIndicators = [
+        //         page.locator('.upload-progress'),
+        //         page.locator('[class*="uploading"]'),
+        //         page.locator('[class*="progress"]'),
+        //         page.getByText('上传中'),
+        //         page.getByText('正在上传')
+        //     ];
 
-            let stillUploading = false;
-            for (const indicator of uploadingIndicators) {
-                try {
-                    if (await indicator.isVisible({ timeout: 200 })) {
-                        stillUploading = true;
-                        break;
-                    }
-                } catch { }
-            }
+        //     let stillUploading = false;
+        //     for (const indicator of uploadingIndicators) {
+        //         try {
+        //             if (await indicator.isVisible({ timeout: 200 })) {
+        //                 stillUploading = true;
+        //                 break;
+        //             }
+        //         } catch { }
+        //     }
 
-            if (!stillUploading && i >= 5) {
-                // Wait at least 5 seconds, then check if upload is done
-                log(`Upload appears complete after ${i + 1} seconds`);
-                break;
-            }
+        //     if (!stillUploading && i >= 5) {
+        //         // Wait at least 5 seconds, then check if upload is done
+        //         log(`Upload appears complete after ${i + 1} seconds`);
+        //         break;
+        //     }
 
-            if (i % 5 === 0) {
-                log(`Upload waiting... ${i + 1}s elapsed`);
-            }
-        }
+        //     if (i % 5 === 0) {
+        //         log(`Upload waiting... ${i + 1}s elapsed`);
+        //     }
+        // }
 
         log("Filling title and content...");
         const titleInput = page.locator('input[placeholder*="标题"]');
@@ -320,8 +337,8 @@ async function runPublish(config: PublishConfig) {
         const maxRetries = 3;
         let publishSuccess = false;
 
-        log("Waiting 30 seconds for publish...");
-        await page.waitForTimeout(30000);
+        // log("Waiting 30 seconds for publish...");
+        // await page.waitForTimeout(30000);
 
         for (let attempt = 1; attempt <= maxRetries && !publishSuccess; attempt++) {
             log(`Publish attempt ${attempt}/${maxRetries}...`);
