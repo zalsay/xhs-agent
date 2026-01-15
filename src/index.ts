@@ -258,11 +258,48 @@ async function runPublish(config: PublishConfig) {
 
         log("Uploading image...");
         const fileInput = page.locator('input[type="file"]');
-        await fileInput.waitFor({ state: 'attached', timeout: 20000 });
+        await fileInput.waitFor({ state: 'attached', timeout: 30000 });
         await fileInput.setInputFiles(actualImagePath);
 
-        log("Waiting for upload processing...");
-        await page.waitForTimeout(5000);
+        // Initial wait for upload to start and process
+        log("Waiting 30 seconds for initial upload processing...");
+        await page.waitForTimeout(30000);
+
+        // Then continue with polling loop (1 second intervals)
+        log("Continuing with upload status polling...");
+        const maxUploadWait = 60; // Max 60 seconds
+        for (let i = 0; i < maxUploadWait; i++) {
+            await page.waitForTimeout(1000);
+
+            // Check if upload progress indicator is still visible
+            const uploadingIndicators = [
+                page.locator('.upload-progress'),
+                page.locator('[class*="uploading"]'),
+                page.locator('[class*="progress"]'),
+                page.getByText('上传中'),
+                page.getByText('正在上传')
+            ];
+
+            let stillUploading = false;
+            for (const indicator of uploadingIndicators) {
+                try {
+                    if (await indicator.isVisible({ timeout: 200 })) {
+                        stillUploading = true;
+                        break;
+                    }
+                } catch { }
+            }
+
+            if (!stillUploading && i >= 5) {
+                // Wait at least 5 seconds, then check if upload is done
+                log(`Upload appears complete after ${i + 1} seconds`);
+                break;
+            }
+
+            if (i % 5 === 0) {
+                log(`Upload waiting... ${i + 1}s elapsed`);
+            }
+        }
 
         log("Filling title and content...");
         const titleInput = page.locator('input[placeholder*="标题"]');
@@ -277,42 +314,170 @@ async function runPublish(config: PublishConfig) {
             await page.keyboard.type(combinedContent);
         }
 
-        log("Ready to publish!");
-        const publishButton = page.getByRole('button', { name: '发布', exact: true });
-        const publishButtonFallback = page.getByText('发布', { exact: true });
+        log("Ready to publish!!!!!!");
 
-        if (await publishButton.isVisible()) {
-            await publishButton.click();
-        } else if (await publishButtonFallback.isVisible()) {
-            await publishButtonFallback.click();
-        } else {
-            const publishNoteBtn = page.getByText('发布笔记', { exact: true });
-            if (await publishNoteBtn.isVisible()) {
-                await publishNoteBtn.click();
+        // Retry logic for publish button
+        const maxRetries = 3;
+        let publishSuccess = false;
+
+        log("Waiting 30 seconds for publish...");
+        await page.waitForTimeout(30000);
+
+        for (let attempt = 1; attempt <= maxRetries && !publishSuccess; attempt++) {
+            log(`Publish attempt ${attempt}/${maxRetries}...`);
+
+            // Click publish button
+            const publishButton = page.getByRole('button', { name: '发布', exact: true });
+            const publishButtonFallback = page.getByText('发布', { exact: true });
+
+            if (await publishButton.isVisible()) {
+                await publishButton.click();
+                log("Clicked main '发布' button");
+            } else if (await publishButtonFallback.isVisible()) {
+                await publishButtonFallback.click();
+                log("Clicked fallback '发布' text button");
             } else {
-                throw new Error("Publish button not found");
+                const publishNoteBtn = page.getByText('发布笔记', { exact: true });
+                if (await publishNoteBtn.isVisible()) {
+                    await publishNoteBtn.click();
+                    log("Clicked '发布笔记' button");
+                } else {
+                    throw new Error("Publish button not found");
+                }
+            }
+
+            log("Clicked publish button, checking for upload popup...");
+
+            // Check for "图片上传中，请稍后" popup and wait if detected
+            const uploadPopupMessages = ['图片上传中', '请稍后', '正在处理', '上传中'];
+            let uploadPopupDetected = false;
+
+            for (const msg of uploadPopupMessages) {
+                try {
+                    const popupEl = page.getByText(msg);
+                    if (await popupEl.isVisible({ timeout: 1000 })) {
+                        log(`Detected upload popup: "${msg}", waiting 3 seconds...`);
+                        uploadPopupDetected = true;
+                        await page.waitForTimeout(3000);
+
+                        // Re-click publish button after waiting
+                        log("Re-clicking publish button after upload popup...");
+                        if (await publishButton.isVisible()) {
+                            await publishButton.click();
+                            log("Re-clicked main '发布' button");
+                        } else if (await publishButtonFallback.isVisible()) {
+                            await publishButtonFallback.click();
+                            log("Re-clicked fallback '发布' text button");
+                        }
+                        break;
+                    }
+                } catch { }
+            }
+
+            log("Waiting for confirmation...");
+
+            // Wait for success message or URL change
+            try {
+                log(`Current URL before waiting: ${page.url()}`);
+
+                // Check each condition separately with logging
+                const successPromises = [
+                    page.getByText('发布成功').waitFor({ timeout: 8000 }).then(() => {
+                        log("Detected: '发布成功' text appeared");
+                        return 'text_success';
+                    }),
+                    page.getByText('发布笔记成功').waitFor({ timeout: 8000 }).then(() => {
+                        log("Detected: '发布笔记成功' text appeared");
+                        return 'text_note_success';
+                    }),
+                    page.waitForURL('**/note/**', { timeout: 8000 }).then(() => {
+                        log(`Detected: URL changed to note page: ${page.url()}`);
+                        return 'url_change';
+                    })
+                ];
+
+                const result = await Promise.race(successPromises);
+                log(`Success detected via: ${result}`);
+                publishSuccess = true;
+            } catch (e: any) {
+                log(`Attempt ${attempt}: Success message not detected. Error: ${e.message}`);
+                log(`Current URL after timeout: ${page.url()}`);
+
+                // Try to capture visible text elements for debugging
+                try {
+                    const buttons = await page.locator('button').allTextContents();
+                    log(`Visible buttons: ${buttons.slice(0, 10).join(', ')}`);
+                } catch { }
+
+                // Check for common success indicators we might have missed
+                const additionalSuccessTexts = ['已发布', '成功', '发布完成', '笔记已发布'];
+                for (const successText of additionalSuccessTexts) {
+                    try {
+                        const el = page.getByText(successText);
+                        if (await el.isVisible({ timeout: 500 })) {
+                            log(`Found alternative success text: "${successText}"`);
+                            publishSuccess = true;
+                            break;
+                        }
+                    } catch { }
+                }
+
+                if (!publishSuccess) {
+                    // Check for error messages
+                    const errorMessages = [
+                        '发布失败',
+                        '请稍后再试',
+                        '网络错误',
+                        '请先登录',
+                        '内容违规',
+                        '审核不通过'
+                    ];
+
+                    let errorDetected = false;
+                    for (const errMsg of errorMessages) {
+                        try {
+                            const errorEl = page.getByText(errMsg);
+                            if (await errorEl.isVisible({ timeout: 500 })) {
+                                log(`Error message detected: ${errMsg}`);
+                                errorDetected = true;
+                                break;
+                            }
+                        } catch {
+                            // Error element not found, continue
+                        }
+                    }
+
+                    if (attempt < maxRetries) {
+                        log(`Waiting 3 seconds before retry...`);
+                        await page.waitForTimeout(3000);
+                    } else {
+                        // Final attempt failed, log page content for debugging
+                        log("All attempts exhausted. Dumping page state...");
+                        log(`Final URL: ${page.url()}`);
+
+                        try {
+                            const pageTitle = await page.title();
+                            log(`Page title: ${pageTitle}`);
+                        } catch { }
+
+                        try {
+                            const pageText = await page.innerText('body');
+                            log(`Page Content (first 2000 chars):\n${pageText.substring(0, 2000)}`);
+                        } catch (innerErr: any) {
+                            log(`Failed to get page text: ${innerErr.message}`);
+                        }
+                    }
+                }
             }
         }
 
-        log("Published! Waiting for confirmation...");
-
-        // Wait for success message or URL change
-        try {
-            await Promise.race([
-                page.getByText('发布成功').waitFor({ timeout: 10000 }),
-                page.getByText('发布笔记成功').waitFor({ timeout: 10000 }),
-                page.waitForURL('**/note/**', { timeout: 10000 }) // Assuming it redirects to note details
-            ]);
-            log("Success detected!");
-        } catch (e) {
-            log("Success message not detected immediately. Checking page content...");
-            const pageText = await page.innerText('body');
-            log(`Current Page URL: ${page.url()}`);
-            log(`Page Content Dump:\n${pageText}`); // Print full content
-        }
-
         await page.waitForTimeout(2000);
-        console.log(JSON.stringify({ taskId: config.taskId, status: 'success', data: { message: '发布操作已执行，请检查小红书后台确认。' } }));
+
+        if (publishSuccess) {
+            console.log(JSON.stringify({ taskId: config.taskId, status: 'success', data: { message: '发布成功！' } }));
+        } else {
+            console.log(JSON.stringify({ taskId: config.taskId, status: 'success', data: { message: '发布操作已执行，请检查小红书后台确认。' } }));
+        }
 
     } catch (e: any) {
         log(`Error: ${e.message}`);
