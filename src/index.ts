@@ -23,11 +23,16 @@ const CDP_PORT = 9222;
 const CDP_ENDPOINT = `http://127.0.0.1:${CDP_PORT}`;
 const USER_DATA_DIR = path.join(os.homedir(), '.auto-tauri', 'browser-profile');
 
-// Chrome 可执行文件路径 (macOS)
+// Chrome 可执行文件路径 (macOS + Windows)
 const CHROME_PATHS = [
+    // macOS
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/Applications/Chromium.app/Contents/MacOS/Chromium',
     path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+    // Windows
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    path.join(os.homedir(), 'AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'),
 ];
 
 // Helper for logging
@@ -170,6 +175,17 @@ async function downloadImage(url: string, dest: string): Promise<void> {
 // ============================================================================
 
 async function runPublish(config: PublishConfig) {
+    // Check if Chrome is installed
+    const chromePath = getChromePath();
+    if (!chromePath) {
+        const isWindows = process.platform === 'win32';
+        const installHint = isWindows
+            ? '请访问 https://www.google.cn/chrome/ 下载安装 Chrome 浏览器'
+            : '请访问 https://www.google.cn/chrome/ 下载安装 Chrome 浏览器，或运行: brew install --cask google-chrome';
+        throw new Error(`未检测到 Chrome 浏览器。${installHint}`);
+    }
+    log(`Found Chrome at: ${chromePath}`);
+
     // Support both imagePaths (array) and imagePath (single) for backward compatibility
     let sourceImagePaths: string[] = [];
     if (config.imagePaths && config.imagePaths.length > 0) {
@@ -498,7 +514,7 @@ async function runPublish(config: PublishConfig) {
 
     } catch (e: any) {
         log(`Error: ${e.message}`);
-        console.log(JSON.stringify({ taskId: config.taskId, status: 'failed', error: e.message }));
+        console.log(JSON.stringify({ taskId: config.taskId, status: 'failed', data: { message: e.message } }));
     } finally {
         // 断开连接但不关闭浏览器
         log("Disconnecting from browser (browser remains open)...");
